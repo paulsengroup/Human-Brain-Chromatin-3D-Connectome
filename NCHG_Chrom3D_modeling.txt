@@ -1,0 +1,87 @@
+for hic_file in raw_data/*/*.hic; do
+    subfolder=$(basename "$(dirname "$hic_file")")
+    output_file="cool_files/${subfolder}.mcool"
+    hictk convert "$hic_file" "$output_file" -t 50
+done
+
+for cool_file in cool_files/*.mcool; do
+    base_name=$(basename "$cool_file" .mcool)
+    ./NCHG expected $cool_file --resolution 1000000 --output "h5/trans_$base_name.h5" --trans-only &
+    ./NCHG expected $cool_file --resolution 50000 --output "h5/cis_$base_name.h5" --cis-only &
+done
+
+for TAD_file in TADs/*/tads_40k/*.bed; do
+    subfolder=$(basename "$(dirname "$(dirname "$TAD_file")")")
+    output_file="TAD_files/${subfolder}.txt"
+    cp "$TAD_file" "$output_file"
+    awk -F'\t' -v OFS='\t' '{$1 = $1; print $1"\t"$2"\t"$3}' $TAD_file > "TAD_files/${subfolder}_hicexplorer.bed"
+done
+
+for TAD_file in *.bed; do
+    base_name=$(basename "$TAD_file" .bed)
+    ./NCHG cartesian-product -c hg38.chrom.sizes $TAD_file > $base_name.bedpe &
+done
+
+
+for cool_file in cool_files/*.mcool; do
+    base_name=$(basename "$cool_file" .mcool)
+    ./NCHG compute $cool_file --resolution 50000 --domains "TAD_files/"$base_name"_hicexplorer.bedpe" --expected-values="h5/cis_"$base_name".h5" "compute/"$base_name"/cis/"$base_name"_hicexplorer" --cis-only &
+    ./NCHG compute $cool_file --resolution 1000000 --domains "TAD_files/"$base_name"_hicexplorer.bedpe" --expected-values="h5/trans_"$base_name".h5" "compute/"$base_name"/trans/"$base_name"_hicexplorer" --trans-only &
+done
+
+for compute_files in compute/*; do
+    subdir_name=$(basename "$compute_files")
+    ./NCHG merge "compute/"$subdir_name"/cis/"$subdir_name"_hicexplorer" "parquet/"$subdir_name"_hicexplorer_cis.parquet" &
+    ./NCHG merge "compute/"$subdir_name"/trans/"$subdir_name"_hicexplorer" "parquet/"$subdir_name"_hicexplorer_trans.parquet" &
+done
+
+for file in parquet/*{cis,trans}.parquet; do
+    base_name=$(basename "$file" .parquet)
+    fdr="0.01"
+    lr="2"
+    ./NCHG filter $file "parquet/"$base_name"_fdr"$fdr"_lr"$lr".parquet" --fdr=$fdr --log-ratio=$lr
+    ./NCHG view "parquet/"$base_name"_fdr"$fdr"_lr"$lr".parquet" --no-write-header > "sig_interactions/"$base_name"_fdr"$fdr"_lr"$lr".tsv"
+    awk '{print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6}' "sig_interactions/"$base_name"_fdr"$fdr"_lr"$lr".tsv" > "sig_interactions/"$base_name"_fdr"$fdr"_lr"$lr".bed"
+done
+
+
+#Get regions with 20% lowest compartment score and store them as B3 subcompartment.
+for cool_file in cool_files/*.mcool; do
+    base_name=$(basename "$cool_file" .mcool) 
+    count=$(wc -l < "Q30_rep2_fixed/"$base_name"/cpt/DpnII-HinfI_A_DpnII-HinfI_200K_compartment.bedgraph")
+    awk -F'\t' '{print $4 "\t" $0}' "Q30_rep2_fixed/"$base_name"/cpt/DpnII-HinfI_A_DpnII-HinfI_200K_compartment.bedgraph" | sort -n | \
+    awk -F'\t' -v OFS='\t' -v total=$count '
+      NR <= total * 0.2 {
+        $1 = ""; sub(/^\t/, ""); print
+      }
+    ' > "LADs/"$base_name"_B3.tsv"
+done
+
+
+
+for cool_file in cool_files/*.mcool; do
+    base_name=$(basename "$cool_file" .mcool)
+    cat TAD_files/${base_name}_hicexplorer.bed  <(bedtools complement -g hg38.chrom.sizes -i TAD_files/${base_name}_hicexplorer.bed)  | bedtools sort -g hg38.chrom.sizes > TAD_files/${base_name}_gtrack.bed
+    awk -F'\t' '!($1 == $4 && $2 == $5 && $3 == $6)' "sig_interactions/merge${base_name}_fdr0.01_cis2_trans2_hicexplorer.bed" | grep -v 'Y' > tmp_filtered.bed
+
+    grep -v 'Y' TAD_files/${base_name}_gtrack.bed > TAD_files/${base_name}_gtrack_Y_removed.bed
+    grep -v 'Y' LADs/${base_name}_B3.tsv > LADs/${base_name}_B3_Y_removed.tsv
+    python3 makeGtrack.py tmp_filtered.bed TAD_files/${base_name}_gtrack_Y_removed.bed > gtrack/${base_name}_lr2_2.gtrack
+    python3 lad_gtrack.py gtrack/${base_name}_lr2_2.gtrack LADs/${base_name}_B3_Y_removed.tsv gtrack/${base_name}_LADs_lr2_2.gtrack
+    rm tmp_filtered.bed
+done
+
+
+run_chrom3d() {
+  file="$1"
+  i="$2"
+  base_name=$(basename "$file" _LADs_lr2_2.gtrack)
+  ./Chrom3D -o sim_all_lr2_2mil/${base_name}_$i.cmm \
+    -r 5.0 -n 2000000 -l 1000 -s $RANDOM -y 0.15 \
+    --nucleus "$file" 2> sim_all_lr2_2mil/${base_name}_$i.log
+}
+
+export -f run_chrom3d
+
+parallel -j 200 run_chrom3d ::: gtrack/*_LADs_lr2_2.gtrack ::: {1..100}
+
