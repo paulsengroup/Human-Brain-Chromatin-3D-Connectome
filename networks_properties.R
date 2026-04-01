@@ -64,8 +64,7 @@ centrality_long$sample <- gsub("_", " ", centrality_long$sample)
 box_stats <- centrality_long %>%
   group_by(sample, metric) %>%
   summarise(
-    middle = median(value, na.rm = TRUE),
-    std = sd(value[is.finite(value)], na.rm = TRUE),
+    value = first(value),
     .groups = "drop"
   )
 
